@@ -1,89 +1,116 @@
+// backend/server.js
 import 'dotenv/config';
-import express from "express";
-import cors from "cors";
-import morgan from "morgan";
-import http from "http";
+import express from 'express';
+import cors from 'cors';
+import morgan from 'morgan';
+import http from 'http';
+import https from 'https';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-//Create an env file with ESP_HOST and PORT variables
-const ESP_HOST = process.env.ESP_HOST;
-const PORT = process.env.PORT;
+// ---------- Config ----------
+function normalizeHost(v) {
+  if (!v) return '';
+  return v.startsWith('http://') || v.startsWith('https://') ? v : `http://${v}`;
+}
 
-// If Node < 18, uncomment next line and install node-fetch:
-// import fetch from "node-fetch";
+const ESP_HOST_RAW = process.env.ESP_HOST || ''; // e.g. "192.168.1.42" or "192.168.1.42:81"
+const ESP_HOST = normalizeHost(ESP_HOST_RAW);    // ensures http:// prefix if missing
+const PORT = process.env.PORT || 4000;           // backend port
+
+if (!ESP_HOST) {
+  console.warn('\n⚠️  No ESP_HOST set in .env – backend will start, but ESP routes will fail.\n');
+}
+
+// Resolve __dirname in ES module
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(cors());                 // allow all origins in dev
+
+// ---------- Middleware ----------
+app.use(cors());
+app.use(morgan('dev'));
 app.use(express.json());
-app.use(morgan("dev"));
 
-// ---- API: status (optional helper on ESP32; if not present returns 404) ----
-app.get("/api/status", async (req, res) => {
-  try {
-    const r = await fetch(`${ESP_HOST}/status`);
-    res.status(r.status);
-    for (const [k, v] of r.headers) res.setHeader(k, v);
-    res.send(await r.text());
-  } catch (e) {
-    res.status(502).send(String(e));
+// Helper to choose http/https based on ESP_HOST
+function getHttpClient(url) {
+  return url.startsWith('https://') ? https : http;
+}
+
+// Generic proxy helper for GET requests
+function proxyGet(req, res, targetPath) {
+  if (!ESP_HOST) {
+    return res.status(500).json({ error: 'ESP_HOST is not configured on the server' });
   }
+
+  const url = `${ESP_HOST}${targetPath}`;
+  const client = getHttpClient(url);
+
+  const espReq = client.get(url, espRes => {
+    // Forward original status and headers (especially important for stream / images)
+    res.writeHead(espRes.statusCode || 500, espRes.headers);
+    espRes.pipe(res);
+  });
+
+  espReq.on('error', err => {
+    console.error(`Error proxying to ESP (${url}):`, err.message);
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Failed to reach ESP32', details: err.message });
+    }
+  });
+}
+
+// ---------- API Routes ----------
+
+// Stream video from ESP -> /api/stream
+app.get('/api/stream', (req, res) => {
+  proxyGet(req, res, '/stream');
 });
 
-// ---- API: capture -> jpeg ---
-app.get("/api/capture", async (req, res) => {
-  try {
-    const r = await fetch(`${ESP_HOST}/capture`);
-    res.setHeader("Content-Type", "image/jpeg");
-    (await r.arrayBuffer()) && res.send(Buffer.from(await r.arrayBuffer()));
-  } catch (e) {
-    res.status(502).send(String(e));
-  }
+// Capture single frame -> /api/capture
+app.get('/api/capture', (req, res) => {
+  proxyGet(req, res, '/capture');
 });
 
-// ---- API: stream -> MJPEG passthrough ----
-app.get("/api/stream", (req, res) => {
-  http.get(`${ESP_HOST}/stream`, (r) => {
-    // forward headers (includes multipart/x-mixed-replace)
-    Object.entries(r.headers).forEach(([k, v]) => v && res.setHeader(k, v));
-    r.pipe(res);
-  }).on("error", (err) => {
-    res.status(502).send(String(err));
+// Get camera info (name, etc.) -> /api/camera-info
+app.get('/api/camera-info', (req, res) => {
+  proxyGet(req, res, '/info');
+});
+
+// Control flash (expects ?pwm=0–255) -> /api/flash?pwm=...
+app.get('/api/flash', (req, res) => {
+  const { pwm } = req.query;
+
+  if (pwm === undefined) {
+    return res.status(400).json({ error: 'Missing "pwm" query parameter' });
+  }
+
+  const targetPath = `/flash?pwm=${encodeURIComponent(pwm)}`;
+  proxyGet(req, res, targetPath);
+});
+
+// Optional: simple health check (does NOT call ESP)
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    espHost: ESP_HOST_RAW || null,
   });
 });
 
-// ---- Controls ----
-app.get("/api/flash", async (req, res) => {
-  const pwm = req.query.pwm ?? "0";
-  try {
-    const r = await fetch(`${ESP_HOST}/flash?pwm=${pwm}`);
-    res.status(r.status).send(await r.text());
-  } catch (e) {
-    res.status(502).send(String(e));
-  }
-});
+// ---------- Static Frontend (React build) ----------
+const distDir = path.join(__dirname, '../frontend/dist');
 
-app.get("/api/setres", async (req, res) => {
-  const size = req.query.size ?? "VGA";
-  try {
-    const r = await fetch(`${ESP_HOST}/setres?size=${encodeURIComponent(size)}`);
-    res.status(r.status).send(await r.text());
-  } catch (e) {
-    res.status(502).send(String(e));
-  }
-});
-
-// ---- Serve frontend in production (after build) ----
-import path from "path";
-import { fileURLToPath } from "url";
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const distDir = path.join(__dirname, "../frontend/dist");
+// Serve compiled frontend if it exists
 app.use(express.static(distDir));
-// Catch-all to serve frontend index.html
+
+// Catch-all: let React Router handle client routes
 app.use((req, res) => {
-  res.sendFile(path.join(distDir, "index.html"));
+  res.sendFile(path.join(distDir, 'index.html'));
 });
 
-
+// ---------- Start ----------
 app.listen(PORT, () => {
-  console.log(`Backend on http://localhost:${PORT}`);
-  console.log(`Proxying ESP32 at ${ESP_HOST}`);
+  console.log(`\n✅ Backend listening:\nhttp://localhost:${PORT}`);
+  console.log(`✅ ESP32 target:\n${ESP_HOST}\n`);
 });

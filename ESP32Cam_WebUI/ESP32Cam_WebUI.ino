@@ -1,32 +1,35 @@
 /*******************************************************
- * ESP32-CAM (AI-Thinker): Serve UI from SPIFFS (/data)
- * - NO fallback page, NO file manager
- * - Root "/" serves /index.html from SPIFFS
- * - Also serves /styles.css from SPIFFS
- * - Endpoints: /stream, /capture, /flash, /setres
+ * ESP32-CAM (AI-Thinker): Minimal API firmware (non-blocking stream)
+ * - Endpoints:
+ *     GET /capture       -> single JPEG
+ *     GET /stream        -> MJPEG multipart stream (non-blocking)
+ *     GET /flash?pwm=0..255
+ *     GET /status        -> JSON
+ *     GET /debug         -> JSON with call counters
  *******************************************************/
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include "esp_camera.h"
-#include <SPIFFS.h>
 
-// ---- Secrets (create config_secrets.h next to this .ino; do NOT commit) ----
+// ---- Secrets (put in config_secrets.h; do NOT commit) ----
 //   #pragma once
-//   #define WIFI_SSID "your-ssid"
-//   #define WIFI_PASS "your-password"
+//   #define WIFI_HOME_SSID "your-ssid"
+//   #define WIFI_HOME_PASS "your-password"
 #include "config_secrets.h"
-#ifndef WIFI_SSID
-  #define WIFI_SSID "YOUR_WIFI"
+
+// Fallbacks if not defined in config_secrets.h
+#ifndef WIFI_HOME_SSID
+#define WIFI_HOME_SSID "YOUR_HOME_SSID"
 #endif
-#ifndef WIFI_PASS
-  #define WIFI_PASS "YOUR_PASS"
+#ifndef WIFI_HOME_PASS
+#define WIFI_HOME_PASS "YOUR_HOME_PASS"
 #endif
 
-// ---- Camera defaults ----
-#define DEFAULT_FRAMESIZE     FRAMESIZE_VGA   // QVGA/VGA/SVGA/XGA/SXGA/UXGA
-#define DEFAULT_JPEG_QUALITY  20              // 10(best)..63(worst)
+// ---- Camera defaults (fixed VGA) ----
+#define DEFAULT_FRAMESIZE FRAMESIZE_VGA  // 640x480
+#define DEFAULT_JPEG_QUALITY 35          // 10(best)..63(worst), higher=faster
 
 // ---- AI-Thinker pins (DO NOT CHANGE) ----
 #define PWDN_GPIO_NUM 32
@@ -47,90 +50,85 @@
 #define PCLK_GPIO_NUM 22
 
 // ---- Flash LED ----
-#define LED_FLASH_PIN        4
-#define LED_FLASH_LEDC_CH    4
-#define LED_FLASH_LEDC_FREQ  5000
-#define LED_FLASH_LEDC_BITS  8
+#define LED_FLASH_PIN 4
+#define LED_FLASH_LEDC_CH 4
+#define LED_FLASH_LEDC_FREQ 5000
+#define LED_FLASH_LEDC_BITS 8
 
 WebServer server(80);
 
-// ---------- Helpers ----------
-bool nameToFrameSize(const String& s, framesize_t& out) {
-  if (s == "QVGA") out = FRAMESIZE_QVGA;
-  else if (s == "VGA")  out = FRAMESIZE_VGA;
-  else if (s == "SVGA") out = FRAMESIZE_SVGA;
-  else if (s == "XGA")  out = FRAMESIZE_XGA;
-  else if (s == "SXGA") out = FRAMESIZE_SXGA;
-  else if (s == "UXGA") out = FRAMESIZE_UXGA;
-  else return false;
-  return true;
-}
+//Camera Name
+const char* CAMERA_NAME = "Esp32Cam-1";
+const char* CAMERA_ROOM = "Outside View";
+const char* CAMERA_ADDRESS = "123 Main Street";
 
-String contentTypeFor(const String& path) {
-  if (path.endsWith(".html")) return "text/html";
-  if (path.endsWith(".css"))  return "text/css";
-  if (path.endsWith(".js"))   return "application/javascript";
-  if (path.endsWith(".png"))  return "image/png";
-  if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
-  if (path.endsWith(".ico"))  return "image/x-icon";
-  return "text/plain";
-}
+// ---- Debug counters ----
+uint32_t g_captureCalls = 0;
+uint32_t g_streamSessions = 0;
+uint32_t g_flashCalls = 0;
+uint32_t g_statusCalls = 0;
+uint32_t g_debugCalls = 0;
 
-// Serve a static file from SPIFFS (404 if missing)
-bool serveFile(String path) {
-  if (path == "/") path = "/index.html";
-  if (!SPIFFS.exists(path)) return false;
-  File f = SPIFFS.open(path, "r");
-  if (!f) return false;
-  server.streamFile(f, contentTypeFor(path));
-  f.close();
-  return true;
-}
+// ---- Streaming state (non-blocking) ----
+WiFiClient streamClient;
+bool streamingActive = false;
+uint32_t lastFrameMs = 0;
+const uint32_t STREAM_INTERVAL_MS = 10;  // min delay between frames
+
+
+
 
 // ---------- Camera init ----------
 bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0       = Y2_GPIO_NUM;
-  config.pin_d1       = Y3_GPIO_NUM;
-  config.pin_d2       = Y4_GPIO_NUM;
-  config.pin_d3       = Y5_GPIO_NUM;
-  config.pin_d4       = Y6_GPIO_NUM;
-  config.pin_d5       = Y7_GPIO_NUM;
-  config.pin_d6       = Y8_GPIO_NUM;
-  config.pin_d7       = Y9_GPIO_NUM;
-  config.pin_xclk     = XCLK_GPIO_NUM;
-  config.pin_pclk     = PCLK_GPIO_NUM;
-  config.pin_vsync    = VSYNC_GPIO_NUM;
-  config.pin_href     = HREF_GPIO_NUM;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
   config.pin_sscb_sda = SIOD_GPIO_NUM;
   config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn     = PWDN_GPIO_NUM;
-  config.pin_reset    = RESET_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
   if (psramFound()) {
-    config.frame_size   = DEFAULT_FRAMESIZE;
+    config.frame_size = DEFAULT_FRAMESIZE;
     config.jpeg_quality = DEFAULT_JPEG_QUALITY;
-    config.fb_count     = 2;
+    config.fb_count = 1;  // single buffer for stability
 #ifdef CAMERA_GRAB_LATEST
-    config.grab_mode    = CAMERA_GRAB_LATEST;
+    config.grab_mode = CAMERA_GRAB_LATEST;
 #endif
   } else {
-    config.frame_size   = FRAMESIZE_QVGA;
-    config.jpeg_quality = 25;
-    config.fb_count     = 1;
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 40;
+    config.fb_count = 1;
   }
-  return (esp_camera_init(&config) == ESP_OK);
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", err);
+    return false;
+  }
+  Serial.println("Camera init OK");
+  return true;
 }
 
-// ---------- Flash PWM (v2.x vs v3.x core compatible) ----------
+// ---------- Flash PWM ----------
 void initFlashPWM() {
   pinMode(LED_FLASH_PIN, OUTPUT);
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcAttach(LED_FLASH_PIN, LED_FLASH_LEDC_FREQ, LED_FLASH_LEDC_BITS); // v3.x API (pin-based)
+  ledcAttach(LED_FLASH_PIN, LED_FLASH_LEDC_FREQ, LED_FLASH_LEDC_BITS);
   ledcWrite(LED_FLASH_PIN, 0);
 #else
   ledcSetup(LED_FLASH_LEDC_CH, LED_FLASH_LEDC_FREQ, LED_FLASH_LEDC_BITS);
@@ -138,6 +136,7 @@ void initFlashPWM() {
   ledcWrite(LED_FLASH_LEDC_CH, 0);
 #endif
 }
+
 void setFlashPWM(uint8_t duty) {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcWrite(LED_FLASH_PIN, duty);
@@ -147,115 +146,230 @@ void setFlashPWM(uint8_t duty) {
 }
 
 // ---------- Handlers ----------
-void handleRoot() {
-  if (!serveFile("/index.html")) server.send(404, "text/plain", "/index.html not found on SPIFFS");
-}
-void handleStatic() {
-  if (!serveFile(server.uri())) server.send(404, "text/plain", "Not found");
-}
 
 void handleCapture() {
+  g_captureCalls++;
+  uint32_t t0 = millis();
+  Serial.printf("[CAPTURE] #%u called at %lu ms\n", g_captureCalls, t0);
+
   camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { server.send(500, "text/plain", "capture failed"); return; }
+  if (!fb) {
+    Serial.println("[CAPTURE] fb == NULL, sending 500");
+    server.send(500, "text/plain", "capture failed");
+    return;
+  }
+
+  Serial.printf("[CAPTURE] frame size = %u bytes\n", fb->len);
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
   server.setContentLength(fb->len);
   server.send(200, "image/jpeg", "");
   WiFiClient c = server.client();
-  c.write(fb->buf, fb->len);
+  size_t w = c.write(fb->buf, fb->len);
   esp_camera_fb_return(fb);
+
+  Serial.printf("[CAPTURE] wrote %u bytes\n", (unsigned)w);
 }
 
+//Handle Camera info
+void handleCameraInfo() {
+  String json = "{";
+  json += "\"name\":\"" + String(CAMERA_NAME) + "\",";
+  json += "\"room\":\"" + String(CAMERA_ROOM) + "\",";
+  json += "\"address\":\"" + String(CAMERA_ADDRESS) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+
+// Non-blocking stream: set up client + headers; frames sent in loop()
 void handleStream() {
-  WiFiClient client = server.client();
-  if (!client) return;
-  client.setNoDelay(true);
-  client.print(
+  g_streamSessions++;
+  uint32_t tStart = millis();
+
+  // If an old stream is active, close it
+  if (streamingActive && streamClient && streamClient.connected()) {
+    Serial.println("[STREAM] Replacing existing stream client");
+    streamClient.stop();
+  }
+
+  streamClient = server.client();
+  if (!streamClient) {
+    Serial.println("[STREAM] client invalid");
+    return;
+  }
+
+  streamClient.setNoDelay(true);
+
+  streamClient.print(
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
     "Cache-Control: no-cache, no-store, must-revalidate\r\n"
     "Pragma: no-cache\r\n"
-    "Connection: keep-alive\r\n\r\n"
-  );
-  while (client.connected()) {
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) { delay(5); continue; }
-    client.print("--frame\r\n");
-    client.print("Content-Type: image/jpeg\r\n");
-    client.print("Content-Length: "); client.print(fb->len); client.print("\r\n\r\n");
-    size_t w = client.write(fb->buf, fb->len);
-    esp_camera_fb_return(fb);
-    if (w != fb->len) break;
-    client.print("\r\n");
-    delay(1);
-  }
-  client.stop();
-}
+    "Connection: keep-alive\r\n\r\n");
 
-void handleSetRes() {
-  if (!server.hasArg("size")) { server.send(400, "text/plain", "missing ?size"); return; }
-  framesize_t fs;
-  if (!nameToFrameSize(server.arg("size"), fs)) { server.send(400, "text/plain", "invalid size"); return; }
-  sensor_t* s = esp_camera_sensor_get();
-  if (!s) { server.send(500, "text/plain", "no sensor"); return; }
-  s->set_framesize(s, fs);
-  server.send(200, "text/plain", "res=" + server.arg("size"));
+  streamingActive = true;
+  lastFrameMs = 0;
+
+  IPAddress remote = streamClient.remoteIP();
+  Serial.printf("[STREAM] Session #%u started from %s at %lu ms\n",
+                g_streamSessions,
+                remote.toString().c_str(),
+                tStart);
 }
 
 void handleFlash() {
-  if (!server.hasArg("pwm")) { server.send(400, "text/plain", "missing ?pwm=0..255"); return; }
+  g_flashCalls++;
+  uint32_t t0 = millis();
+  Serial.printf("[FLASH] #%u called at %lu ms\n", g_flashCalls, t0);
+
+  if (!server.hasArg("pwm")) {
+    Serial.println("[FLASH] missing ?pwm");
+    server.send(400, "text/plain", "missing ?pwm=0..255");
+    return;
+  }
   int pwm = constrain(server.arg("pwm").toInt(), 0, 255);
   setFlashPWM(pwm);
+  Serial.printf("[FLASH] pwm=%d\n", pwm);
   server.send(200, "text/plain", String("flash=") + pwm);
+}
+
+void handleStatus() {
+  g_statusCalls++;
+  uint32_t t0 = millis();
+  Serial.printf("[STATUS] #%u called at %lu ms\n", g_statusCalls, t0);
+
+  String j = String("{\"ip\":\"") + WiFi.localIP().toString() + "\",\"heap\":" + ESP.getFreeHeap() + ",\"psram\":" + ESP.getPsramSize() + "}";
+  server.send(200, "application/json", j);
+}
+
+// Small debug endpoint returning counters
+void handleDebug() {
+  g_debugCalls++;
+  uint32_t t0 = millis();
+  Serial.printf("[DEBUG] #%u called at %lu ms\n", g_debugCalls, t0);
+
+  String j = "{";
+  j += "\"capture\":" + String(g_captureCalls);
+  j += ",\"stream\":" + String(g_streamSessions);
+  j += ",\"flash\":" + String(g_flashCalls);
+  j += ",\"status\":" + String(g_statusCalls);
+  j += ",\"debug\":" + String(g_debugCalls);
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+// ---------- WIFI CONNECT ----------
+void connectWiFi() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setHostname("esp32cam");
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+  Serial.println("[WIFI] Connecting...");
+  Serial.printf("[WIFI] SSID: %s\n", WIFI_HOME_SSID);
+
+  WiFi.begin(WIFI_HOME_SSID, WIFI_HOME_PASS);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) {
+    delay(500);
+    wl_status_t st = WiFi.status();
+    Serial.print(".");
+    Serial.print((int)st);
+  }
+  Serial.println();
+
+  wl_status_t finalStatus = WiFi.status();
+  if (finalStatus == WL_CONNECTED) {
+    Serial.print("[WIFI] Connected. IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.print("[WIFI] Connect failed. Status = ");
+    Serial.println((int)finalStatus);
+  }
+}
+
+// ---------- Streaming frame sender (called from loop) ----------
+void pumpStreamFrame() {
+  if (!streamingActive) return;
+  if (!streamClient || !streamClient.connected()) {
+    if (streamingActive) {
+      Serial.println("[STREAM] client disconnected, stopping stream");
+    }
+    streamingActive = false;
+    if (streamClient) streamClient.stop();
+    return;
+  }
+
+  uint32_t now = millis();
+  if (now - lastFrameMs < STREAM_INTERVAL_MS) {
+    return;  // too soon, wait a bit
+  }
+  lastFrameMs = now;
+
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("[STREAM] fb == NULL, skipping frame");
+    return;
+  }
+
+  // Write multipart frame
+  streamClient.print("--frame\r\n");
+  streamClient.print("Content-Type: image/jpeg\r\n");
+  streamClient.print("Content-Length: ");
+  streamClient.print(fb->len);
+  streamClient.print("\r\n\r\n");
+
+  size_t w = streamClient.write(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+
+  if (w != fb->len) {
+    Serial.printf("[STREAM] short write: wrote %u of %u, closing\n",
+                  (unsigned)w, (unsigned)fb->len);
+    streamClient.stop();
+    streamingActive = false;
+    return;
+  }
+
+  streamClient.print("\r\n");
 }
 
 // ---------- Setup / Loop ----------
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  delay(200);
 
-  // Mount SPIFFS (no formatting, just mount; if empty, you'll get 404)
-  if (!SPIFFS.begin(false)) {
-    Serial.println("SPIFFS mount FAILED. Make sure you upload /data.");
+  Serial.println("\n=== ESP32-CAM Home Security Firmware (NON-BLOCKING STREAM) ===");
+
+  if (!initCamera()) {
+    Serial.println("Camera init failed! Halting.");
     while (true) { delay(1000); }
   }
 
-  if (!initCamera()){
-    Serial.println("Camera init failed! Check power/board/PSRAM.");
-    while(true){ delay(1000); }
-  }
   initFlashPWM();
+  connectWiFi();
 
-  // WiFi
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setHostname("esp32cam");
-  Serial.printf("Connecting to %s\n", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-    delay(500); Serial.print(".");
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi connected: "); Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("WiFi connect failed (check SSID/pass and 2.4 GHz).");
-  }
-
-  // Routes (only what you asked for)
-  server.on("/",        HTTP_GET, handleRoot);
+  // Routes
   server.on("/capture", HTTP_GET, handleCapture);
-  server.on("/stream",  HTTP_GET, handleStream);
-  server.on("/flash",   HTTP_GET, handleFlash);
-  server.on("/setres",  HTTP_GET, handleSetRes);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.on("/flash", HTTP_GET, handleFlash);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/info", HTTP_GET, handleCameraInfo);
+  server.on("/debug", HTTP_GET, handleDebug);
 
-  // Any other path tries to serve a file (e.g., /styles.css)
-  server.onNotFound(handleStatic);
+  server.onNotFound([]() {
+    Serial.printf("[404] %s\n", server.uri().c_str());
+    server.send(404, "text/plain", "Not found");
+  });
 
   server.begin();
-  Serial.println("HTTP server started. Open http://<esp32-ip>/");
+  Serial.println("[HTTP] Server started.");
+  Serial.println("Try: /capture, /stream, /flash, /status, /debug");
 }
 
 void loop() {
-  server.handleClient();
+  server.handleClient();  // handle new HTTP requests
+  pumpStreamFrame();      // send one frame if streaming
 }

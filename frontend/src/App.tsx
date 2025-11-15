@@ -1,54 +1,153 @@
-import { useMemo, useState } from "react";
+import { useCallback, useState, useEffect } from "react";
+import "./index.css";
+
+import placeholderImg from "./assets/PhotoPlaceholder.jpg";
+import locationIcon from "./assets/locationIcon.png";
 
 function App() {
-  const [backend, setBackend] = useState<string>("http://localhost:8080");
-  const streamUrl = useMemo(
-    () => `${backend}/api/stream?ts=${Date.now()}`,
-    [backend]
-  );
+  // Backend address, stored in localStorage
+  const backend = "http://localhost:8000";
 
-  async function snap() {
-    const r = await fetch(`${backend}/api/capture`);
-    const b = await r.blob();
-    const url = URL.createObjectURL(b);
-    const a = document.createElement("a");
-    a.href = url; a.download = "snapshot.jpg"; a.click();
-    URL.revokeObjectURL(url);
-  }
+  // Camera info
+  const [cameraName, setCameraName] = useState<string>("Camera");
+  const [cameraRoom, setCameraRoom] = useState<string>("Home View");
+  const [cameraAddress, setCameraAddress] = useState<string>("Street Address");
 
-  async function setRes(size: string) {
-    await fetch(`${backend}/api/setres?size=${encodeURIComponent(size)}`);
-    // refresh stream
-    const img = document.getElementById("cam") as HTMLImageElement;
-    img.src = `${backend}/api/stream?ts=${Date.now()}`;
-  }
+  // Whether streaming is on
+  const [isStreaming, setIsStreaming] = useState(false);
 
-  async function setFlash(v: number) {
-    await fetch(`${backend}/api/flash?pwm=${v}`).catch(()=>{});
-  }
+  // Flash level
+  const [flashLevel, setFlashLevel] = useState<"off" | "low" | "high">("off");
+
+  // Build full URL from backend base + path
+  const buildUrl = (path: string) => {
+    if (!backend) return "";
+    return `${backend}${path}`;
+  };
+
+  // Stream URL
+  const streamUrl = isStreaming ? buildUrl("/api/stream") : "";
+
+  const startStream = () => setIsStreaming(true);
+  const stopStream = () => setIsStreaming(false);
+  const onStreamError = () => console.warn("Stream error.");
+
+  //Camera info
+
+  useEffect(() => {
+    if (!backend) return;
+
+    const fetchInfo = async () => {
+      try {
+        const res = await fetch(`${backend}/api/camera-info`);
+        if (!res.ok) throw new Error("Failed to fetch camera info");
+        const data = await res.json();
+
+        if (data.name) setCameraName(data.name);
+        if (data.room) setCameraRoom(data.room);
+        if (data.address) setCameraAddress(data.address);
+      } catch (err) {
+        console.error("camera info error:", err);
+      }
+    };
+
+    fetchInfo();
+  }, []);
+
+  // Snapshot
+  const snap = useCallback(async () => {
+    const url = buildUrl("/api/capture");
+    try {
+      const res = await fetch(url);
+      const blob = await res.blob();
+      const dl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = dl;
+      a.download = `snapshot_${Date.now()}.jpg`;
+      a.click();
+      URL.revokeObjectURL(dl);
+    } catch (err) {
+      console.error(err);
+      alert("Snapshot failed.");
+    }
+  }, []);
+
+  // Flash logic
+  const levelToPwm = (level: "off" | "low" | "high") => {
+    if (level === "off") return 0;
+    if (level === "low") return 100;
+    return 255;
+  };
+
+  const changeFlash = async (level: "off" | "low" | "high") => {
+    setFlashLevel(level);
+    const pwm = levelToPwm(level);
+    const url = buildUrl(`/api/flash?pwm=${pwm}`);
+    if (!url) return alert("Enter backend address first!");
+
+    try {
+      await fetch(url);
+    } catch (err) {
+      console.error(err);
+    }
+  };
 
   return (
-    <div style={{maxWidth: 900, margin: "0 auto", fontFamily: "system-ui, Arial"}}>
-      <h3>ESP32-CAM Dashboard</h3>
-
-      <div style={{display:"flex", gap:12, flexWrap:"wrap", marginBottom:12}}>
-        <button onClick={snap}>Snapshot ↧</button>
-        <label>Resolution:&nbsp;
-          <select onChange={(e)=>setRes(e.target.value)} defaultValue="VGA">
-            <option>QVGA</option><option>VGA</option><option>SVGA</option>
-            <option>XGA</option><option>SXGA</option><option>UXGA</option>
-          </select>
-        </label>
-        <label>Flash:&nbsp;
-          <input type="range" min={0} max={255} defaultValue={0}
-                 onInput={(e)=>setFlash(Number((e.target as HTMLInputElement).value))}/>
-        </label>
-        <input value={backend} onChange={e=>setBackend(e.target.value)} style={{width:340}} />
+    <div className="page">
+      <div className="stream">
+        <div className="stream-box">
+          {isStreaming && backend ? (
+            <img
+              id="cam"
+              src={streamUrl}
+              alt="ESP32 Stream"
+              onError={onStreamError}
+            />
+          ) : (
+            <img
+              src={placeholderImg}
+              alt="Placeholder"
+              className="placeholder-image"
+            />
+          )}
+          <div className="img-options left">
+            <button>{cameraName}</button>
+            <div className="camera-info">
+              <h2>{cameraRoom}</h2>
+              <span className="location">
+                <img src={locationIcon} className="small-icon" alt="Location" />{" "}
+                {cameraAddress}
+              </span>
+            </div>
+          </div>
+          <div className="img-options right">
+            <button onClick={isStreaming ? stopStream : startStream}>
+              {isStreaming ? "Stop Stream" : "Start Stream"}
+            </button>
+          </div>
+        </div>
       </div>
 
-      {/* MJPEG stream via <img> */}
-      <img id="cam" src={streamUrl} alt="camera"
-           style={{maxWidth:"100%", border:"1px solid #ddd", borderRadius:10}} />
+      {/* Right: Controls */}
+      <div className="panel controls">
+        <h3>Controls</h3>
+
+        <label className="row">
+          <span>Flash</span>
+          <select
+            value={flashLevel}
+            onChange={(e) =>
+              changeFlash(e.target.value as "off" | "low" | "high")
+            }
+          >
+            <option value="off">Off</option>
+            <option value="low">Low</option>
+            <option value="high">High</option>
+          </select>
+        </label>
+
+        <button onClick={snap}>Snapshot</button>
+      </div>
     </div>
   );
 }
