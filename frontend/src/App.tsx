@@ -140,9 +140,9 @@ function App() {
               changeFlash(e.target.value as "off" | "low" | "high")
             }
           >
-            <option value="off">Off</option>
-            <option value="low">Low</option>
-            <option value="high">High</option>
+            <option value="off">OFF</option>
+            <option value="low">LOW</option>
+            <option value="high">HIGH</option>
           </select>
         </label>
 
